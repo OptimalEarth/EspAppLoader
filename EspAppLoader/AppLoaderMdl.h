@@ -268,6 +268,7 @@ public:
   const esp_partition_t *running() const { return running_; }
   const esp_partition_t *boot() const { return boot_; }
   const esp_partition_t *target() const { return target_; }
+  const esp_partition_t *loader() const { return loader_; }
 
   bool imageFits(uint32_t size) const {
     return target_ != nullptr && size > 0 && size <= target_->size;

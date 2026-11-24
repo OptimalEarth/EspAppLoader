@@ -25,8 +25,8 @@
 */
 
 #define ESP_APPLOADER_NAME       "EspAppLoader"
-#define ESP_APPLOADER_VERSION    "0.5.4-test1"
-#define ESP_APPLOADER_BUILD_ID   "2026-11-18.namespace1"
+#define ESP_APPLOADER_VERSION    "2026-11-23-5"
+#define ESP_APPLOADER_BUILD_ID   "2026-11-23-5"
 
 #include <Arduino.h>
 #include <SPI.h>

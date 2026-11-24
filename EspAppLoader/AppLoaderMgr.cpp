@@ -12,12 +12,17 @@
 #include "AppLoaderMdl.h"
 #include "AppLoaderFlashImageMgr.h"
 #include "AppLoaderStartupPolicy.h"
+#include "AppLoaderProvisionMgr.h"
+#include "AppLoaderProvisionState.h"
+#include "AppLoaderRollbackMgr.h"
 #include "AppLoaderCommandMgr.h"
 #include "WTgPlatform.h"
 #include "AppLoaderSerialVw.h"
 #include "AppLoaderWebVw.h"
 
 namespace esp_apploader {
+
+using AppLoaderProvisionState = AppLoaderProvisionStateT<MAX_APP_FILENAME>;
 
 /** Coordinates command channels, authorization, SD repository, and installation. */
 // The controller coordinates startup, command handling, and installation.
@@ -43,17 +48,13 @@ public:
     const bool recoveryRequested = recoveryPinLow ||
         digitalRead(BLE_ENABLE_BUTTON_PIN) == LOW ||
         (repo_.ready() && SD.exists(ESP_APPLOADER_RECOVERY_MARKER));
-    const bool sdHasApps = !recoveryRequested && repo_.scan() > 0;
-    // Attempt a flash-only handoff before initializing peripherals needed
-    // by the loader. If the handoff fails, continue into the command interface.
-    if (AppLoaderStartupPolicy::fallback(
-            repo_.ready(), sdHasApps, recoveryRequested)) {
-      serial_.write("Startup fallback: validating existing operational image.\r\n");
-      bootExistingApp(serial_);
-      serial_.write("Fallback could not boot; staying in AppLoader.\r\n");
-    } else if (recoveryRequested) {
-      serial_.write("Recovery requested; automatic application boot suppressed.\r\n");
+    provisioningStateReady_ = provisioningState_.load(provisioningRecord_);
+    const bool provisioningHold = !provisioningStateReady_ ||
+        provisioningRecord_.mode != AppLoaderProvisionState::None;
+    if (provisioningHold) {
+      serial_.write("PROVISION state=hold: automatic fallback suppressed.\r\n");
     }
+    const bool sdHasApps = !recoveryRequested && repo_.scan() > 0;
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     identity_.begin();
     log_.begin();
@@ -66,17 +67,6 @@ public:
     boardBringup_.printTo(serial_);
     bootCfg_.load();
     bootMgr_.inspect();
-    if (bootMgr_.canMutateFlash()) {
-      const esp_err_t loaderBootErr = bootMgr_.selectAppLoader();
-      if (loaderBootErr != ESP_OK) {
-        char warning[160];
-        snprintf(warning, sizeof(warning),
-                 "WARNING: Could not persist %s as the AppLoader boot partition: %s\r\n",
-                 APPLOADER_PARTITION_LABEL, esp_err_to_name(loaderBootErr));
-        serial_.write(warning);
-      }
-      bootMgr_.inspect();
-    }
     ble_.setDeviceName(identity_.unitNum());
     ble_.begin();
     cmdMgr_.configure(serial_, ble_, this, dispatchCommand);
@@ -92,13 +82,54 @@ public:
     snprintf(line, sizeof(line), "Reset reason: %d\r\n",
              static_cast<int>(esp_reset_reason()));
     serial_.write(line);
-    AppLoaderSerialVw::printMode(serial_, bootMgr_.canMutateFlash());
     if (!bootCfg_.valid()) {
       serial_.write("WARNING: /boot.cfg is missing or invalid; no SD default application is available.\r\n");
     }
     serial_.write(
       "BLE disabled at startup. Hold GPIO4 for more than 2 seconds but "
       "less than 10 seconds to toggle BLE.\r\n");
+    // Serial/command handling and safe outputs are ready. Optional SD and
+    // peripherals do not determine whether this maintenance loader is usable.
+    bootMgr_.inspect();
+    const bool rolesReady = bootMgr_.running() && bootMgr_.loader() &&
+        bootMgr_.target() && bootMgr_.loader()->address != bootMgr_.target()->address;
+    const esp_err_t identityResult = rolesReady
+        ? provisioningMgr_.inspectIdentity(bootMgr_.running(), loaderIdentity())
+        : ESP_ERR_INVALID_STATE;
+    const esp_err_t confirmResult = ESP_APPLOADER_TEST_MODE != 0
+        ? ESP_ERR_INVALID_STATE : AppLoaderRollbackMgr::confirm(identityResult == ESP_OK);
+    rollbackReady_ = confirmResult == ESP_OK;
+    if (!rollbackReady_) {
+      serial_.write("ERR appLdr2App1 code=loader_confirmation_failed: flash and boot changes blocked.\r\n");
+    } else {
+      serial_.write("PROVISION state=loader_ready: startup confirmation passed.\r\n");
+    }
+    if (rollbackReady_ && bootMgr_.canMutateFlash() &&
+        (!bootMgr_.boot() || bootMgr_.boot()->address != bootMgr_.running()->address)) {
+      const esp_err_t loaderBootErr = bootMgr_.selectAppLoader();
+      if (loaderBootErr != ESP_OK) {
+        char warning[160];
+        snprintf(warning, sizeof(warning),
+                 "WARNING: Could not persist %s as the AppLoader boot partition: %s\r\n",
+                 APPLOADER_PARTITION_LABEL, esp_err_to_name(loaderBootErr));
+        serial_.write(warning);
+      }
+      bootMgr_.inspect();
+    }
+    AppLoaderSerialVw::printMode(serial_, rollbackReady_ && bootMgr_.canMutateFlash());
+    if (rollbackReady_ && AppLoaderStartupPolicy::fallback(
+            repo_.ready(), sdHasApps, recoveryRequested || provisioningHold)) {
+      serial_.write("Startup fallback: validating existing operational image.\r\n");
+      bootExistingApp(serial_);
+      serial_.write("Fallback could not boot; staying in AppLoader.\r\n");
+    } else if (recoveryRequested) {
+      serial_.write("Recovery requested; automatic application boot suppressed.\r\n");
+    }
+    if (!provisioningStateReady_) {
+      serial_.write("ERR appLdr2App1 code=state_read: provisioning record unavailable or invalid.\r\n");
+    } else if (rollbackReady_ && provisioningRecord_.mode == AppLoaderProvisionState::Install) {
+      resumeProvisioning(recoveryRequested);
+    }
     return repo_.ready() && bootMgr_.targetAvailable();
   }
 
@@ -123,6 +154,11 @@ private:
   AppLoaderIdentityMdl identity_;          // Hardware UID and configured unit number.
   AppLoaderBootCfgMdl bootCfg_;               // SD/NVS startup-application selection.
   AppLoaderFlashImageMgr flashImageMgr_; // Read-only on-flash inspection.
+  AppLoaderProvisionMgr provisioningMgr_;
+  AppLoaderProvisionState provisioningState_;
+  AppLoaderProvisionState::Record provisioningRecord_;
+  bool provisioningStateReady_ = false;
+  bool rollbackReady_ = false;
   AppLoaderBootMgr bootMgr_;               // Validated app1/app0 partition mapping.
   AppLoaderLogMdl log_;              // Event and installation audit writer.
   AppLoaderAppRepoMdl repo_;                  // SD application-image repository.
@@ -348,12 +384,13 @@ private:
       return;
     }
 
-    char *argument = strchr(command, ' ');
+    char *argument = strpbrk(command, " \t");
     if (argument != nullptr) {
       *argument++ = '\0';
       argument = trim(argument);
     }
 
+    if (strcasecmp(command, "appLdr2App1") == 0) return appLdr2App1Cmd(argument, channel);
     if (strcasecmp(command, "help?") == 0) return printHelp(channel);
     if (strcasecmp(command, "status?") == 0) return printStatus(channel);
     if (strcasecmp(command, "recovery?") == 0) {
@@ -600,6 +637,7 @@ private:
   void printHelp(AppLoaderCmdChannel &channel) {
     channel.write(
       "Commands:\r\n"
+      "  appLdr2App1 <0|1>      Copy loader to app1; 0=install SD default and boot app0, 1=stay app1\r\n"
       "  recovery?              Report GPIO4 and SD marker; no recovery action\r\n"
       "  status?                AppLoader and SD status\r\n"
       "  identity?              Module and software identity\r\n"
@@ -637,7 +675,7 @@ private:
              ble_.enabled() ? "active" : "inactive",
              ble_.initialized() ? "initialized/retained" : "not initialized");
     channel.write(line);
-    AppLoaderSerialVw::printMode(channel, bootMgr_.canMutateFlash());
+    AppLoaderSerialVw::printMode(channel, rollbackReady_ && bootMgr_.canMutateFlash());
     channel.write(bootCfg_.valid() ? "Boot configuration: valid\r\n" : "Boot configuration: INVALID OR MISSING\r\n");
     channel.write(rtcReady_ ? "RTC: DS3231 ready\r\n" : "RTC: unavailable\r\n");
     channel.write(boardBringup_.allPassed() ? "Board bring-up: PASS\r\n" : "Board bring-up: FAIL\r\n");
@@ -994,6 +1032,168 @@ private:
     return true;
   }
 
+  static const AppLoaderProvisionIdentity &loaderIdentity() {
+    // Referenced at runtime and retained as a contiguous record in the image.
+    static const AppLoaderProvisionIdentity identity __attribute__((used)) = {
+      "EspAppLoader.identity:1:8a7c6d21-4fa0-4e58-b2e5-7a2fc158d402",
+      ESP_APPLOADER_VERSION, ESP_APPLOADER_BUILD_ID
+    };
+    return identity;
+  }
+
+  static void provisioningYield() { delay(0); }
+
+  void provisioningError(AppLoaderCmdChannel &channel, const char *code) {
+    char line[160];
+    snprintf(line, sizeof(line), "ERR appLdr2App1 code=%s\r\n", code);
+    channel.write(line);
+  }
+
+  bool clearProvisioningHold(AppLoaderCmdChannel &channel) {
+    if (provisioningStateReady_ && provisioningRecord_.mode == AppLoaderProvisionState::None)
+      return true;
+    if (!provisioningState_.clear()) {
+      provisioningError(channel, "state_write");
+      return false;
+    }
+    provisioningRecord_ = AppLoaderProvisionState::Record{};
+    provisioningStateReady_ = true;
+    return true;
+  }
+
+  void appLdr2App1Cmd(const char *argument, AppLoaderCmdChannel &channel) {
+    const int option = AppLoaderProvisionMgr::bootOption(argument);
+    if (option < 0) {
+      provisioningError(channel, "usage_expected_0_or_1");
+      return;
+    }
+    if (ESP_APPLOADER_TEST_MODE != 0) {
+      provisioningError(channel, "test_mode");
+      return;
+    }
+    if (!rollbackReady_) {
+      provisioningError(channel, "loader_confirmation_failed");
+      return;
+    }
+    if (uploadModeActive_ || uploadInProgress_) {
+      provisioningError(channel, "upload_active");
+      return;
+    }
+    bootMgr_.inspect();
+    const esp_partition_t *running = bootMgr_.running();
+    const esp_partition_t *loader = bootMgr_.loader();
+    const esp_partition_t *operational = bootMgr_.target();
+    if (!running || !loader || !operational ||
+        strcmp(running->label, "app0") || strcmp(loader->label, "app1") ||
+        strcmp(operational->label, "app0") ||
+        running->address != operational->address) {
+      provisioningError(channel, "requires_loader_running_in_app0");
+      return;
+    }
+    const esp_err_t identityResult = provisioningMgr_.inspectIdentity(running, loaderIdentity());
+    if (identityResult != ESP_OK) {
+      char error[180];
+      snprintf(error, sizeof(error),
+               "ERR appLdr2App1 code=source_not_apploader detail=%s\r\n",
+               esp_err_to_name(identityResult));
+      channel.write(error);
+      return;
+    }
+    const AppLoaderProvisionIdentity &sourceIdentity = provisioningMgr_.sourceIdentity();
+    char identityLine[200];
+    snprintf(identityLine, sizeof(identityLine),
+             "PROVISION state=identity_verified source=app0 product=EspAppLoader version=%.31s build=%.47s\r\n",
+             sourceIdentity.version, sourceIdentity.build);
+    channel.write(identityLine);
+    AppLoaderProvisionState::Record request;
+    request.mode = option == 0 ? AppLoaderProvisionState::Install
+                               : AppLoaderProvisionState::Hold;
+    if (request.mode == AppLoaderProvisionState::Install) {
+      if (!resolveArgument("default", request.filename, channel)) {
+        provisioningError(channel, "sd_default_unavailable");
+        return;
+      }
+      AppLoaderAppImage image;
+      if (!validate(request.filename, image, channel)) {
+        provisioningError(channel, "sd_default_invalid");
+        return;
+      }
+      request.size = image.fileSize;
+      memcpy(request.digest, image.sha256, sizeof(request.digest));
+    }
+    channel.write("PROVISION state=copying source=app0 destination=app1\r\n");
+    const esp_err_t result = provisioningMgr_.copy(false, running, loader,
+                                                  operational, loaderIdentity(), provisioningYield);
+    if (result != ESP_OK) {
+      char line[180];
+      snprintf(line, sizeof(line), "ERR appLdr2App1 code=copy_failed detail=%s\r\n",
+               esp_err_to_name(result));
+      channel.write(line);
+      return;
+    }
+    if (!provisioningState_.save(request)) {
+      provisioningError(channel, "state_write");
+      return;
+    }
+    // This is a separate, narrow provisioning path. Normal installer policy
+    // continues to reject writing app0 while app0 is running.
+    const esp_err_t bootResult = esp_ota_set_boot_partition(loader);
+    if (bootResult != ESP_OK) {
+      provisioningError(channel, "boot_selection_failed");
+      return;
+    }
+    channel.write("OK appLdr2App1 stage=copy_verified next_boot=app1\r\n");
+    if (request.mode == AppLoaderProvisionState::Install)
+      channel.write("PROVISION state=handoff: app1 will install the saved SD default and boot app0.\r\n");
+    delay(350);
+    ESP.restart();
+  }
+
+  void resumeProvisioning(bool recoveryRequested) {
+    // Consume automatic installation BEFORE modifying app0. A reset or failure
+    // thereafter holds app1 for inspection, rather than repeating flash writes.
+    const AppLoaderProvisionState::Record request = provisioningRecord_;
+    AppLoaderProvisionState::Record hold;
+    hold.mode = AppLoaderProvisionState::Hold;
+    if (!provisioningState_.save(hold)) {
+      provisioningError(serial_, "state_write");
+      return;
+    }
+    provisioningRecord_ = hold;
+    bootMgr_.inspect();
+    if (!rollbackReady_ || !bootMgr_.canMutateFlash() ||
+        strcmp(bootMgr_.running()->label, "app1") ||
+        !bootMgr_.boot() ||
+        bootMgr_.boot()->address != bootMgr_.running()->address) {
+      provisioningError(serial_, "handoff_requires_app1");
+      return;
+    }
+    if (recoveryRequested) {
+      provisioningError(serial_, "recovery_requested");
+      return;
+    }
+    if (!repo_.ready()) {
+      provisioningError(serial_, "sd_unavailable");
+      return;
+    }
+    AppLoaderAppImage image;
+    if (!validate(request.filename, image, serial_) ||
+        image.fileSize != request.size ||
+        memcmp(image.sha256, request.digest, sizeof(request.digest))) {
+      provisioningError(serial_, "sd_source_changed_or_invalid");
+      return;
+    }
+    // performInstall also revalidates and compares flashed bytes with the SD
+    // source; it never writes the currently running partition.
+    performInstall(request.filename, serial_, &request);
+    if (state_ != AppLoaderState::ReadyToBoot) {
+      provisioningError(serial_, "install_failed");
+      return;
+    }
+    // Use the exact captured candidate, independent of later /boot.cfg edits.
+    bootExistingApp(serial_, true);
+  }
+
   void startupCommand(const char *argument, AppLoaderCmdChannel &channel) {
     char filename[MAX_APP_FILENAME];
     if (!resolveArgument(argument, filename, channel)) return;
@@ -1015,7 +1215,7 @@ private:
   }
 
   void installCommand(const char *argument, AppLoaderCmdChannel &channel) {
-    if (!bootMgr_.canMutateFlash()) {
+    if (!rollbackReady_ || !bootMgr_.canMutateFlash()) {
       channel.write("ERR installation disabled: test mode or invalid running/target roles.\r\n");
       return;
     }
@@ -1033,8 +1233,9 @@ private:
 
   // Installation and boot selection are separate operations. A successful
   // write and read-back leave the loader in control until a boot command.
-  void performInstall(const char *filename, AppLoaderCmdChannel &channel) {
-    if (!bootMgr_.canMutateFlash()) {
+  void performInstall(const char *filename, AppLoaderCmdChannel &channel,
+                      const AppLoaderProvisionState::Record *expected = nullptr) {
+    if (!rollbackReady_ || !bootMgr_.canMutateFlash()) {
       channel.write("ERR installation disabled by build/partition policy.\r\n");
       return;
     }
@@ -1042,6 +1243,12 @@ private:
     // have changed between the initial display and confirmation.
     AppLoaderAppImage image;
     if (!validate(filename, image, channel)) return;
+    if (expected && (image.fileSize != expected->size ||
+        memcmp(image.sha256, expected->digest, sizeof(expected->digest)))) {
+      provisioningError(channel, "sd_source_changed");
+      state_ = AppLoaderState::InstallationFailed;
+      return;
+    }
     state_ = AppLoaderState::Installing;
     transactionPrevious_[0] = '\0';
     readInstalledFilename(transactionPrevious_, sizeof(transactionPrevious_));
@@ -1133,22 +1340,32 @@ private:
     return true;
   }
 
-  void bootExistingApp(AppLoaderCmdChannel &channel) {
+  void bootExistingApp(AppLoaderCmdChannel &channel, bool provisioning = false) {
     bootMgr_.inspect();
-    if (!bootMgr_.canMutateFlash()) {
+    if (!rollbackReady_ || !bootMgr_.canMutateFlash()) {
       channel.write("ERR boot disabled by build/partition policy.\r\n");
       return;
     }
     // Always validate now, never trust a cached inspection or stale SD record.
-    if (!inspectExistingApp(channel)) return;
+    if (!inspectExistingApp(channel)) {
+      if (provisioning) provisioningError(channel, "installed_image_invalid");
+      return;
+    }
+    if (!clearProvisioningHold(channel)) return;
     const esp_err_t result = bootMgr_.selectOperationalApp();
     if (result != ESP_OK) {
       char line[160];
       snprintf(line, sizeof(line), "ERR selecting existing app: %s\r\n",
                esp_err_to_name(result));
       channel.write(line);
+      if (provisioning) {
+        provisioningRecord_.mode = AppLoaderProvisionState::Hold;
+        provisioningState_.save(provisioningRecord_);
+        provisioningError(channel, "boot_select_failed");
+      }
       return;
     }
+    if (provisioning) channel.write("OK appLdr2App1 stage=install_verified next_boot=app0\r\n");
     state_ = AppLoaderState::ReadyToBoot;
     if (repo_.ready()) log_.event("Boot of validated existing flash image");
     channel.write("Booting existing app; app0 remains selected after reset. Automatic return is not implemented.\r\n");
@@ -1159,7 +1376,7 @@ private:
   // Match the recorded installation to the configured default before
   // pointing the ESP bootloader at the operational slot.
   void bootApp(AppLoaderCmdChannel &channel) {
-    if (!bootMgr_.canMutateFlash()) {
+    if (!rollbackReady_ || !bootMgr_.canMutateFlash()) {
       channel.write("ERR bootapp disabled: test mode or invalid running/target roles.\r\n");
       return;
     }
@@ -1180,6 +1397,7 @@ private:
       channel.write(line);
       return;
     }
+    if (!inspectExistingApp(channel) || !clearProvisioningHold(channel)) return;
     const esp_partition_t *target = bootMgr_.target();
     const esp_partition_t *verified = esp_ota_get_boot_partition();
     if (verified == nullptr || verified->address != target->address) {

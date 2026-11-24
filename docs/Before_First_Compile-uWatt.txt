@@ -1,0 +1,55 @@
+EspAppLoader first compile on the 8 MB uWatt
+===========================================
+SPDX-License-Identifier: MPL-2.0
+
+These instructions are for Arduino IDE on Windows.
+
+1. Install the ESP32 board package
+
+   In Arduino IDE, open Tools > Board > Boards Manager.
+   Search for "esp32" and find "esp32 by Espressif Systems".
+   Select version 3.3.12 in the version dropdown and click Install.
+
+   If the package is missing from Boards Manager, open File > Preferences.
+   Add this URL to Additional Boards Manager URLs and search again:
+
+   https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+   If you already installed 4.0.0, select and install 3.3.12 for this
+   build. BLEDevice.h comes with the Espressif board package.
+
+2. Install the sketch libraries
+
+   In Library Manager, install these versions:
+
+     RTClib          2.1.4
+     Adafruit BusIO  1.17.4
+
+   If Library Manager installs BusIO as a dependency, check its version.
+
+3. Open the sketch and select the board settings
+
+   Open EspAppLoader/EspAppLoader.ino from the repository. Keep the
+   supplied partitions.csv beside the .ino file.
+
+   Under Tools, select:
+
+     Board             ESP32 Dev Module (under esp32)
+     Flash Size        8MB
+     Partition Scheme  Custom
+
+   Select the board first so the ESP32-specific settings appear.
+
+4. Verify the build
+
+   Click Verify (the checkmark) to compile. A connected board and COM
+   port are unnecessary for this step.
+
+   If BLEDevice.h is missing, enable verbose output during compilation
+   under File > Preferences and click Verify again. Check:
+
+     FQBN: esp32:esp32:esp32:FlashSize=8M,PartitionScheme=custom
+     Using core: the path should end in esp32\3.3.12
+
+   The repository's sketch.yaml pins dependencies for Arduino CLI.
+   When using Arduino IDE, make the selections above in the IDE.

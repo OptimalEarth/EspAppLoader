@@ -10,7 +10,8 @@
 
 #pragma once
 // Operational bench profile. Provision this image into app1.
-// Flash/boot mutations require running in the configured loader partition.
+// Normal flash/boot mutations require running in the configured loader partition.
+// appLdr2App1 is a guarded provisioning path from app0 to inactive app1.
 #define ESP_APPLOADER_TEST_MODE 0
 #define ESP_APPLOADER_LOADER_LABEL "app1"
 #define ESP_APPLOADER_OPERATIONAL_LABEL "app0"
